@@ -1,5 +1,9 @@
 # Reward.py
 
+import json
+import re
+from typing import Dict, Any
+
 import torch
 from typing import List, Dict, Any
 from unsloth import FastLanguageModel
@@ -117,23 +121,167 @@ class RewardModel:
 
         response = decoded.split("### Response:")[-1].strip()
 
-        return response #self._parse_structured_response(decoded)
+        return self._parse_structured_response(response)
 
     def _parse_structured_response(self, response: str) -> Dict[str, Any]:
         """
-        TODO:
-        Extract structured attributes, e.g.
-        likelihood, focality, location, change
+        Parse LLM output expected to contain a JSON object with keys like:
+        Likelihood, Focality, Location(s), Change(s)
         """
-        return {}
+
+        # 1) Remove code fences if present
+        cleaned = response.strip()
+        cleaned = re.sub(r"^```json", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"^```", "", cleaned).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+
+        # 2) Extract JSON substring (in case of extra text)
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match is None:
+            return {}
+
+        json_str = match.group(0)
+
+        # 3) Parse JSON
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError:
+            return {}
+
+        # 4) Normalize keys (optional but strongly recommended)
+        normalized = {}
+
+        key_map = {
+            "Likelihood": "likelihood",
+            "Focality": "focality",
+            "Location(s)": "location",
+            "Locations": "location",
+            "Change(s)": "change",
+            "Changes": "change",
+        }
+
+        for k, v in parsed.items():
+            key = key_map.get(k, k.lower())
+            normalized[key] = v
+
+        return normalized
+
 
     def _compute_reward(
         self,
         parsed_vlm: Dict[str, Any],
         parsed_gt: Dict[str, Any],
     ) -> float:
-        """
-        TODO:
-        Compare parsed attributes and return scalar reward.
-        """
-        return 0.0
+
+        # =========================================================
+        # Reward coefficients (TUNABLE HYPERPARAMETERS)
+        # =========================================================
+
+        # Likelihood (most important)
+        ALPHA_FALSE_POSITIVE = 0.8     # GT = none, prediction > none
+        ALPHA_LIKELIHOOD_DIST = 0.25   # ordinal distance penalty
+        BETA_LIKELIHOOD_MATCH = 0.6    # exact likelihood match reward
+
+        # Internal consistency
+        ALPHA_INCONSISTENT_FOCALITY = 0.4
+        ALPHA_INCONSISTENT_LOCATION = 0.4
+
+        # Focality
+        BETA_FOCALITY_MATCH = 0.2
+        ALPHA_FOCALITY_MISMATCH = 0.2
+
+        # Location
+        BETA_LOCATION_EXACT_MATCH = 0.3
+        ALPHA_LOCATION_MISSING = 0.15
+        ALPHA_LOCATION_INVENTED = 0.35
+
+        # =========================================================
+        # Likelihood (ORDINAL)
+        # =========================================================
+
+        reward = 0.0
+
+        LIKELIHOOD_MAP = {
+            "none": 0,
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+        }
+
+        l_gt = LIKELIHOOD_MAP.get(
+            str(parsed_gt.get("likelihood", "none")).lower(), 0
+        )
+        l_vlm = LIKELIHOOD_MAP.get(
+            str(parsed_vlm.get("likelihood", "none")).lower(), 0
+        )
+
+        # False positive: very strong penalty
+        if l_gt == 0 and l_vlm > 0:
+            reward -= ALPHA_FALSE_POSITIVE * l_vlm
+
+        # Ground truth present: ordinal disagreement
+        elif l_gt > 0:
+            dist = abs(l_vlm - l_gt)
+            reward -= ALPHA_LIKELIHOOD_DIST * dist
+
+            # Exact match reward
+            if dist == 0:
+                reward += BETA_LIKELIHOOD_MATCH
+
+        # =========================================================
+        # Internal consistency
+        # =========================================================
+
+        if l_vlm == 0:
+            if parsed_vlm.get("focality") not in [None, "", "NA", "unknown"]:
+                reward -= ALPHA_INCONSISTENT_FOCALITY
+            if parsed_vlm.get("location") not in [None, "", "NA", "unknown"]:
+                reward -= ALPHA_INCONSISTENT_LOCATION
+
+        # =========================================================
+        # Focality
+        # =========================================================
+
+        focality_gt = str(parsed_gt.get("focality", "")).lower()
+        focality_vlm = str(parsed_vlm.get("focality", "")).lower()
+
+        if focality_gt and focality_vlm:
+            if focality_gt == focality_vlm:
+                reward += BETA_FOCALITY_MATCH
+            else:
+                reward -= ALPHA_FOCALITY_MISMATCH
+
+        # =========================================================
+        # Location
+        # =========================================================
+
+        def _split_locations(x):
+            if x in [None, "", "NA", "unknown"]:
+                return set()
+            return {loc.strip().lower() for loc in str(x).split(",")}
+
+        gt_locs = _split_locations(parsed_gt.get("location"))
+        vlm_locs = _split_locations(parsed_vlm.get("location"))
+
+        missing = gt_locs - vlm_locs
+        invented = vlm_locs - gt_locs
+
+        # Exact location match reward
+        if gt_locs and gt_locs == vlm_locs:
+            reward += BETA_LOCATION_EXACT_MATCH
+        else:
+            reward -= ALPHA_LOCATION_MISSING * len(missing)
+            reward -= ALPHA_LOCATION_INVENTED * len(invented)
+
+        # =========================================================
+        # Change (ignored for now)
+        # =========================================================
+
+        # =========================================================
+        # PPO-friendly clipping
+        # =========================================================
+
+        reward = max(min(reward, 1.0), -1.0)
+
+        return reward
+
