@@ -20,7 +20,7 @@ from Callbacks import WandBPredictionLogger
 # Overal settings
 # ------------------------------------------------------------
 
-mode = 'image'  # 'image' or 'image_and_heatmap'
+mode = 'image_and_heatmap'  # 'image' or 'image_and_heatmap'
 date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 # ------------------------------------------------------------
@@ -72,8 +72,8 @@ log.info("Instruction prompt loaded")
 # ------------------------------------------------------------
 log.info("Creating datasets")
 
-train_dataset = ChestXrayDataset(train_df, instruction_prompt)
-val_dataset = ChestXrayDataset(val_df, instruction_prompt)
+train_dataset = ChestXrayDataset(train_df, instruction_prompt, mode=mode)
+val_dataset = ChestXrayDataset(val_df, instruction_prompt, mode=mode)
 
 log.info("Datasets created")
 
@@ -141,7 +141,7 @@ def collate_fn(examples: list[dict[str, Any]]):
     images = []
 
     for example in examples:
-        images.append([example["image"].convert("RGB")])
+        images.append([img.convert("RGB") for img in example["images"]])
         texts.append(
             processor.apply_chat_template(
                 example["messages"],
@@ -183,9 +183,9 @@ learning_rate = 2e-4
 args = SFTConfig(
     output_dir=f"{model_name}-{mode}-lora-{date_str}",
     num_train_epochs=num_train_epochs,
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=4,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=2, #4
+    per_device_eval_batch_size=2, #4
+    gradient_accumulation_steps=8, #4
     gradient_checkpointing=True,
     optim="adamw_torch_fused",
     logging_steps=50,
@@ -253,7 +253,7 @@ trainer.add_callback(
     WandBPredictionLogger(
         dataset=val_dataset,
         processor=processor,
-        num_samples=2,
+        num_samples=5,
     )
 )
 

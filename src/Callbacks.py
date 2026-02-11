@@ -14,6 +14,7 @@ class WandBPredictionLogger(TrainerCallback):
         self.processor = processor
         self.num_samples = num_samples
         self.max_new_tokens = max_new_tokens
+        self.mode = dataset.mode
 
     def on_evaluate(self, args, state, control, **kwargs):
         model = kwargs["model"]
@@ -24,7 +25,7 @@ class WandBPredictionLogger(TrainerCallback):
         for i in range(self.num_samples):
             example = self.dataset[i]
 
-            image = example["image"]
+            images = example["images"]
             messages = example["messages"]
 
             prompt = self.processor.apply_chat_template(
@@ -35,7 +36,7 @@ class WandBPredictionLogger(TrainerCallback):
 
             inputs = self.processor(
                 text=[prompt],
-                images=[[image]],
+                images=[images],
                 return_tensors="pt",
                 padding=True
             ).to(model.device)
@@ -58,16 +59,31 @@ class WandBPredictionLogger(TrainerCallback):
 
             target = messages[-1]["content"][0]["text"]
 
-            rows.append([
-                wandb.Image(image, caption="Input X-ray"),
-                prediction,
-                target,
-            ])
+            if self.mode == 'image_and_heatmap':
+                rows.append([
+                    wandb.Image(images[0], caption="Original X-ray"),
+                    wandb.Image(images[1], caption="Heatmap Overlay"),
+                    prediction,
+                    target,
+                ])
+            else:
+                rows.append([
+                    wandb.Image(images[0], caption="Original X-ray"),
+                    prediction,
+                    target,
+                ])
 
-        table = wandb.Table(
-            columns=["image", "prediction", "ground_truth"],
-            data=rows,
-        )
+        # Create table with appropriate columns based on mode
+        if self.mode == 'image_and_heatmap':
+            table = wandb.Table(
+                columns=["original_image", "heatmap_image", "prediction", "ground_truth"],
+                data=rows,
+            )
+        else:
+            table = wandb.Table(
+                columns=["image", "prediction", "ground_truth"],
+                data=rows,
+            )
 
         wandb.log(
             {
