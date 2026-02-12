@@ -1,8 +1,10 @@
 import os
 import wandb
 import logging
+import argparse
 import torch
 import pandas as pd
+from pathlib import Path
 
 from datetime import datetime
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig, TrainerCallback
@@ -20,16 +22,37 @@ from Callbacks import WandBPredictionLogger
 # Overal settings
 # ------------------------------------------------------------
 
+parser = argparse.ArgumentParser(description="SFT training for MedGemma chest X-ray.")
+parser.add_argument("--output-dir", type=str, default=None, help="Override output directory.")
+parser.add_argument(
+    "--resume-from-checkpoint",
+    type=str,
+    default=None,
+    help="Checkpoint path, or 'auto' to pick latest checkpoint under output-dir.",
+)
+parser.add_argument("--eval-steps", type=int, default=25, help="Evaluation cadence in optimizer steps.")
+parser.add_argument("--logging-steps", type=int, default=25, help="Logging cadence in optimizer steps.")
+cli_args = parser.parse_args()
+
+
+def get_latest_checkpoint(output_dir: str) -> str | None:
+    checkpoints = sorted(Path(output_dir).glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+    return str(checkpoints[-1]) if checkpoints else None
+
 mode = 'image_and_heatmap'  # 'image' or 'image_and_heatmap'
+experiment_tag = "single_image_overlay"
+wandb_project = "medgemma-chest-xray-single-image-overlay"
 date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+is_main_process = local_rank == 0
 
 # ------------------------------------------------------------
 # Logging setup
 # ------------------------------------------------------------
-LOG_DIR = "../csv/loggings"
+LOG_DIR = f"../csv/loggings_{experiment_tag}"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-log_path = os.path.join(LOG_DIR, f"train_medgemma_{mode}_{date_str}.log")
+log_path = os.path.join(LOG_DIR, f"train_medgemma_{experiment_tag}_{mode}_{date_str}.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,9 +63,9 @@ logging.basicConfig(
     ],
 )
 
-log = logging.getLogger("medgemma-train")
+log = logging.getLogger(f"medgemma-train-{experiment_tag}")
 log.info("Starting MedGemma fine-tuning script")
-log.info(f"Mode: {mode}, date: {date_str}")
+log.info(f"Mode: {mode}, date: {date_str}, experiment: {experiment_tag}")
 
 # ------------------------------------------------------------
 # Load dataframes
@@ -179,19 +202,27 @@ log.info("Configuring training arguments")
 
 num_train_epochs = 1
 learning_rate = 2e-4
+output_dir = cli_args.output_dir or f"{model_name}-{experiment_tag}-{mode}-lora-{date_str}"
+resume_from_checkpoint = cli_args.resume_from_checkpoint
+if resume_from_checkpoint == "auto":
+    resume_from_checkpoint = get_latest_checkpoint(output_dir)
+    if resume_from_checkpoint:
+        log.info("Auto-resume checkpoint found: %s", resume_from_checkpoint)
+    else:
+        log.info("Auto-resume requested but no checkpoint found in %s", output_dir)
 
 args = SFTConfig(
-    output_dir=f"{model_name}-{mode}-lora-{date_str}",
+    output_dir=output_dir,
     num_train_epochs=num_train_epochs,
     per_device_train_batch_size=2, #4
     per_device_eval_batch_size=2, #4
     gradient_accumulation_steps=8, #4
     gradient_checkpointing=True,
     optim="adamw_torch_fused",
-    logging_steps=50,
+    logging_steps=cli_args.logging_steps,
     save_strategy="epoch",
     eval_strategy="steps",
-    eval_steps=50,
+    eval_steps=cli_args.eval_steps,
     learning_rate=learning_rate,
     bf16=True,
     max_grad_norm=0.3,
@@ -199,8 +230,9 @@ args = SFTConfig(
     lr_scheduler_type="linear",
     push_to_hub=True,
     hub_private_repo=True,
-    report_to=["tensorboard", "wandb"],
+    report_to=["wandb"],
     gradient_checkpointing_kwargs={"use_reentrant": False},
+    ddp_find_unused_parameters=False,
     dataset_kwargs={"skip_prepare_dataset": True},
     remove_unused_columns=False,
     label_names=["labels"], 
@@ -213,22 +245,24 @@ log.info("Training arguments configured")
 # ------------------------------------------------------------
 log.info("Initializing Weights & Biases run")
 
-wandb.init(
-    project="medgemma-chest-xray",
-    name=f"{model_name}-{mode}-{date_str}",
-    config={
-        "model": model_name,
-        "num_train_epochs": num_train_epochs,
-        "learning_rate": learning_rate,
-        "train_samples": len(train_df),
-        "val_samples": len(val_df),
-        "lora_r": peft_config.r,
-        "lora_alpha": peft_config.lora_alpha,
-        "lora_dropout": peft_config.lora_dropout,
-        "batch_size": args.per_device_train_batch_size,
-        "gradient_accumulation": args.gradient_accumulation_steps,
-    },
-)
+if is_main_process:
+    wandb.init(
+        project=wandb_project,
+        name=f"{model_name}-{experiment_tag}-{mode}-{date_str}",
+        config={
+            "model": model_name,
+            "experiment_tag": experiment_tag,
+            "num_train_epochs": num_train_epochs,
+            "learning_rate": learning_rate,
+            "train_samples": len(train_df),
+            "val_samples": len(val_df),
+            "lora_r": peft_config.r,
+            "lora_alpha": peft_config.lora_alpha,
+            "lora_dropout": peft_config.lora_dropout,
+            "batch_size": args.per_device_train_batch_size,
+            "gradient_accumulation": args.gradient_accumulation_steps,
+        },
+    )
 
 
 # ------------------------------------------------------------
@@ -259,7 +293,7 @@ trainer.add_callback(
 
 
 log.info("Starting training")
-trainer.train()
+trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 log.info("Training completed")
 
 

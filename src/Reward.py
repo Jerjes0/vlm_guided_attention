@@ -1,17 +1,19 @@
 # Reward.py
 
 import json
+import math
 import re
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import torch
-from typing import List, Dict, Any
-from unsloth import FastLanguageModel
+# from unsloth import FastLanguageModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
+
 
 # ----------------- CONFIG -----------------
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_TOKENS = 128
 
 JUDGE_MODEL_NAME = (
@@ -34,28 +36,41 @@ PROMPT_TEMPLATE = """Below is an instruction that describes a task, paired with 
 
 
 class RewardModel:
-    def __init__(self):
+    def __init__(self, device):
+        self.device = device
+        self.device_str = str(device) if isinstance(device, torch.device) else str(device)
         # -------- Load instruction once --------
         with open(PROMPT_FILE, "r") as f:
             self.instruction = f.read().strip()
+            self.base_model_name = "unsloth/medgemma-27B-text-it-unsloth-bnb-4bit"
+            self.judge_model_name = (
+                "/home/jerjes/repos/CXR_LLM_Benchmark/finetuned_models/new/"
+                "medgemma-27B-text-it-unsloth-bnb-4bit_short"
+            )
 
-        # -------- Load judge model once --------
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=JUDGE_MODEL_NAME,
-            max_seq_length=2048,
-            dtype=None,
+        quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.base_model_name,
+            quantization_config=quantization_config,
+            device_map={"": self.device_str},
         )
 
         self.model = PeftModel.from_pretrained(
-            self.model,
-            JUDGE_MODEL_NAME,
+            base_model,
+            self.judge_model_name,
             is_trainable=False,
         )
-        self.model = self.model.merge_and_unload()
 
-        FastLanguageModel.for_inference(self.model)
+        self.model = self.model.merge_and_unload()
         self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.judge_model_name)
+
 
     @torch.no_grad()
     def score(
@@ -102,7 +117,7 @@ class RewardModel:
             return_tensors="pt",
             padding=True,
             truncation=True,
-        ).to(DEVICE)
+        ).to(self.device)
 
         outputs = self.model.generate(
             **inputs,
@@ -172,6 +187,9 @@ class RewardModel:
         parsed_vlm: Dict[str, Any],
         parsed_gt: Dict[str, Any],
     ) -> float:
+        
+        if not parsed_vlm or not parsed_gt:
+            return -1.0
 
         # =========================================================
         # Reward coefficients (TUNABLE HYPERPARAMETERS)
@@ -281,7 +299,9 @@ class RewardModel:
         # PPO-friendly clipping
         # =========================================================
 
-        reward = max(min(reward, 1.0), -1.0)
+        
+        reward = math.tanh(reward / 0.7)
+
+        # reward = max(min(reward, 1.0), -1.0)
 
         return reward
-
