@@ -1,6 +1,7 @@
 import json
 import wandb
 import torch
+import numpy as np
 
 from transformers import TrainerCallback
 
@@ -18,6 +19,11 @@ class WandBPredictionLogger(TrainerCallback):
         self.max_new_tokens = max_new_tokens
 
     def on_evaluate(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if wandb.run is None:
+            return
+
         model = kwargs["model"]
         model.eval()
         device = next(model.parameters()).device
@@ -66,7 +72,7 @@ class WandBPredictionLogger(TrainerCallback):
             table_data.append([*padded_images, prediction, target])
 
         table = wandb.Table(columns=table_columns, data=table_data)
-        wandb.log({"predictions": table, "global_step": state.global_step})
+        wandb.log({"predictions": table}, step=state.global_step)
 
 
 class WandBGRPOPredictionLogger(TrainerCallback):
@@ -141,7 +147,11 @@ class WandBGRPOPredictionLogger(TrainerCallback):
 
                 parsed_prediction = self.reward_model._run_judge(text=prediction_text)
                 parsed_ground_truth = self.reward_model._run_judge(text=reference_text)
-                reward_value = self.reward_model._compute_reward(parsed_prediction, parsed_ground_truth)
+                reward_value = self.reward_model._compute_reward(
+                    parsed_prediction,
+                    parsed_ground_truth,
+                    generation_text=prediction_text,
+                )
 
                 image_cells = [wandb.Image(img, caption=f"image_{k}") for k, img in enumerate(images)]
                 rows.append(
@@ -172,4 +182,120 @@ class WandBGRPOPredictionLogger(TrainerCallback):
 
         table = wandb.Table(columns=table_columns, data=table_data)
         wandb.log({"grpo_predictions": table, "global_step": state.global_step})
+        self._last_logged_step = state.global_step
+
+
+class GRPOHeldoutRewardEvaluator(TrainerCallback):
+    """
+    Evaluates fixed held-out GRPO samples and logs reward/termination diagnostics.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        processor,
+        reward_model,
+        num_samples=100,
+        max_new_tokens=64,
+        log_every_n_steps=100,
+    ):
+        self.dataset = dataset
+        self.processor = processor
+        self.reward_model = reward_model
+        self.num_samples = num_samples
+        self.max_new_tokens = max_new_tokens
+        self.log_every_n_steps = log_every_n_steps
+        self._last_logged_step = -1
+
+    def on_log(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if state.global_step <= 0:
+            return
+        if state.global_step % self.log_every_n_steps != 0:
+            return
+        if state.global_step == self._last_logged_step:
+            return
+
+        model = kwargs["model"]
+        model.eval()
+        device = next(model.parameters()).device
+
+        prompt_texts = []
+        completion_texts = []
+        reference_texts = []
+        clipped = 0
+        terminated = 0
+        total = 0
+
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = eos_token_id
+
+        with torch.no_grad():
+            for i in range(min(self.num_samples, len(self.dataset))):
+                example = self.dataset[i]
+                prompt_messages = example["prompt"]
+                images = example["images"]
+                reference_text = example["reference_text"]
+
+                prompt_text = self.processor.apply_chat_template(
+                    prompt_messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+
+                inputs = self.processor(
+                    text=[prompt_text],
+                    images=[images],
+                    return_tensors="pt",
+                    padding=True,
+                ).to(device)
+
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                )
+
+                generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+                has_eos = bool((generated_ids == eos_token_id).any().item()) if eos_token_id is not None else False
+                hit_max_tokens = generated_ids.shape[0] >= self.max_new_tokens
+                if has_eos:
+                    terminated += 1
+                if hit_max_tokens and not has_eos:
+                    clipped += 1
+
+                generated = self.processor.decode(outputs[0], skip_special_tokens=True)
+                prediction_text = generated.rsplit("model\n", 1)[-1].strip() if "model\n" in generated else generated.strip()
+
+                prompt_texts.append(prompt_text)
+                completion_texts.append(prediction_text)
+                reference_texts.append(reference_text)
+                total += 1
+
+        rewards = self.reward_model.score(
+            prompts=prompt_texts,
+            generations=completion_texts,
+            references=reference_texts,
+        )
+
+        reward_mean = float(np.mean(rewards)) if rewards else 0.0
+        reward_std = float(np.std(rewards)) if rewards else 0.0
+        clipped_ratio = float(clipped / total) if total > 0 else 0.0
+        terminated_ratio = float(terminated / total) if total > 0 else 0.0
+
+        wandb.log(
+            {
+                "eval/reward_mean": reward_mean,
+                "eval/reward_std": reward_std,
+                "eval/completions_clipped_ratio": clipped_ratio,
+                "eval/completions_terminated_ratio": terminated_ratio,
+                "eval/num_samples": total,
+                "global_step": state.global_step,
+            }
+        )
         self._last_logged_step = state.global_step

@@ -14,7 +14,7 @@ from peft import PeftModel
 # ----------------- CONFIG -----------------
 
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_TOKENS = 128
+MAX_TOKENS = 64
 
 JUDGE_MODEL_NAME = (
     "/home/jerjes/repos/CXR_LLM_Benchmark/finetuned_models/new/"
@@ -95,7 +95,11 @@ class RewardModel:
             parsed_gt = self._run_judge(text=reference)
 
             # -------- Compute reward --------
-            reward = self._compute_reward(parsed_vlm, parsed_gt)
+            reward = self._compute_reward(
+                parsed_vlm,
+                parsed_gt,
+                generation_text=generation,
+            )
             rewards.append(float(reward))
 
         return rewards
@@ -186,11 +190,8 @@ class RewardModel:
         self,
         parsed_vlm: Dict[str, Any],
         parsed_gt: Dict[str, Any],
+        generation_text: str | None = None,
     ) -> float:
-        
-        if not parsed_vlm or not parsed_gt:
-            return -1.0
-
         # =========================================================
         # Reward coefficients (TUNABLE HYPERPARAMETERS)
         # =========================================================
@@ -213,11 +214,42 @@ class RewardModel:
         ALPHA_LOCATION_MISSING = 0.15
         ALPHA_LOCATION_INVENTED = 0.35
 
+        # Format compliance
+        BETA_FORMAT_ALL_FIELDS_PRESENT = 0.5
+        ALPHA_FORMAT_MISSING_FIELD = 0.3
+
+        # =========================================================
+        # Initialize reward and apply format term first
+        # =========================================================
+        reward = 0.0
+        if generation_text is not None:
+            normalized = generation_text.lower()
+            required_field_patterns = {
+                "findings_header": r"\bfindings\s*:",
+                "lines_and_tubes": r"\blines\s+and\s+tubes\s*[:=]",
+                "mediastinum": r"\bmediastin\w*\s*[:=]",
+                "lungs": r"\blungs\s*:",
+                "pleura": r"\bpleura\s*:",
+                "bones_and_soft_tissue": r"\bbones\s+and\s+soft\s+tissue\s*:",
+                "impression_header": r"\bimpression\s*:",
+            }
+
+            missing_fields = 0
+            for pattern in required_field_patterns.values():
+                if re.search(pattern, normalized) is None:
+                    missing_fields += 1
+
+            if missing_fields == 0:
+                reward += BETA_FORMAT_ALL_FIELDS_PRESENT
+            else:
+                reward -= ALPHA_FORMAT_MISSING_FIELD * missing_fields
+
+        if not parsed_vlm or not parsed_gt:
+            return reward - 1.0
+
         # =========================================================
         # Likelihood (ORDINAL)
         # =========================================================
-
-        reward = 0.0
 
         LIKELIHOOD_MAP = {
             "none": 0,
@@ -300,7 +332,7 @@ class RewardModel:
         # =========================================================
 
         
-        reward = math.tanh(reward / 0.7)
+        reward = math.tanh(reward) # normalize 
 
         # reward = max(min(reward, 1.0), -1.0)
 
