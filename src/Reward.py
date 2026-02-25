@@ -14,7 +14,8 @@ from peft import PeftModel
 # ----------------- CONFIG -----------------
 
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_TOKENS = 64
+MAX_TOKENS = 256
+JUDGE_BATCH_SIZE = 8
 
 JUDGE_MODEL_NAME = (
     "/home/jerjes/repos/CXR_LLM_Benchmark/finetuned_models/new/"
@@ -70,6 +71,12 @@ class RewardModel:
         self.model = self.model.merge_and_unload()
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.judge_model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Cache judge parses for repeated reference reports.
+        self._reference_parse_cache: Dict[str, Dict[str, Any]] = {}
+        self._judge_batch_size = JUDGE_BATCH_SIZE
 
 
     @torch.no_grad()
@@ -84,17 +91,27 @@ class RewardModel:
         with the SAME judge prompt structure.
         """
 
+        del prompts  # Reward is currently based on generation/reference content.
+
+        # Batch judge parsing for generated outputs.
+        parsed_vlm_list = self._run_judge_batch(generations)
+
+        # Parse each unique reference once, then reuse.
+        unique_missing_refs = []
+        seen = set()
+        for ref in references:
+            if ref not in self._reference_parse_cache and ref not in seen:
+                unique_missing_refs.append(ref)
+                seen.add(ref)
+        if unique_missing_refs:
+            parsed_missing = self._run_judge_batch(unique_missing_refs)
+            for ref, parsed in zip(unique_missing_refs, parsed_missing):
+                self._reference_parse_cache[ref] = parsed
+
+        parsed_gt_list = [self._reference_parse_cache.get(ref, {}) for ref in references]
+
         rewards = []
-
-        for prompt, generation, reference in zip(prompts, generations, references):
-
-            # -------- Parse VLM output --------
-            parsed_vlm = self._run_judge(text=generation)
-
-            # -------- Parse ground truth --------
-            parsed_gt = self._run_judge(text=reference)
-
-            # -------- Compute reward --------
+        for generation, parsed_vlm, parsed_gt in zip(generations, parsed_vlm_list, parsed_gt_list):
             reward = self._compute_reward(
                 parsed_vlm,
                 parsed_gt,
@@ -104,43 +121,62 @@ class RewardModel:
 
         return rewards
 
-    def _run_judge(self, text: str) -> Dict[str, Any]:
-        """
-        Runs the judge LLM on a single piece of text using the
-        EXACT same prompt structure as the benchmark script.
-        """
-
-        judge_prompt = PROMPT_TEMPLATE.format(
+    def _build_judge_prompt(self, text: str) -> str:
+        return PROMPT_TEMPLATE.format(
             self.instruction,
             text,
             "",
         )
 
-        inputs = self.tokenizer(
-            [judge_prompt],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(self.device)
+    @torch.no_grad()
+    def _run_judge_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+        if not texts:
+            return []
 
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=MAX_TOKENS,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=self.tokenizer.eos_token_id,
-            temperature=None,
-            top_p=None,
-        )
+        parsed_results: List[Dict[str, Any]] = []
+        for start in range(0, len(texts), self._judge_batch_size):
+            chunk = texts[start:start + self._judge_batch_size]
+            judge_prompts = [self._build_judge_prompt(text) for text in chunk]
 
-        decoded = self.tokenizer.batch_decode(
-            outputs,
-            skip_special_tokens=True,
-        )[0]
+            inputs = self.tokenizer(
+                judge_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(self.device)
 
-        response = decoded.split("### Response:")[-1].strip()
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=MAX_TOKENS,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                temperature=None,
+                top_p=None,
+            )
 
-        return self._parse_structured_response(response)
+            input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            for i, input_len in enumerate(input_lengths):
+                generated_ids = outputs[i][int(input_len):]
+                response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                parsed_results.append(self._parse_structured_response(response))
+
+        return parsed_results
+
+    def _run_judge(self, text: str) -> Dict[str, Any]:
+        """
+        Runs the judge LLM on a single piece of text using the
+        EXACT same prompt structure as the benchmark script.
+        """
+        return self._run_judge_batch([text])[0]
+
+    def parse_text(self, text: str) -> Dict[str, Any]:
+        """Public helper to parse one report with the judge model."""
+        return self._run_judge(text)
+
+    def parse_texts(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Public helper to parse multiple reports with the judge model."""
+        return self._run_judge_batch(texts)
 
     def _parse_structured_response(self, response: str) -> Dict[str, Any]:
         """
@@ -216,7 +252,7 @@ class RewardModel:
 
         # Format compliance
         BETA_FORMAT_ALL_FIELDS_PRESENT = 0.5
-        ALPHA_FORMAT_MISSING_FIELD = 0.3
+        ALPHA_FORMAT_MISSING_FIELD = 0.1
 
         # =========================================================
         # Initialize reward and apply format term first

@@ -12,16 +12,17 @@ from transformers import AutoProcessor, pipeline
 from Dataset import ChestXrayDataset
 
 # ------------------------------------------------------------
-# Run configuration (edit only here)
+# Run configuration 
 # ------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 MODE = "image_and_heatmap"  # "image" or "image_and_heatmap"
-STATE = "zs"
+STATE = "ft"
+FT_STATE = 'grpo'
 
 # Can be a hub model ID or a local run path under models/.
 MODEL_CHECKPOINT = "google/medgemma-1.5-4b-it"
-# MODEL_CHECKPOINT = PROJECT_ROOT / "models" / "medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-lora-YYYY-MM-DD_HH-MM-SS"
+MODEL_CHECKPOINT = PROJECT_ROOT / "models" / 'medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-grpo-2026-02-14_16-55-27' #"medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-lora-2026-02-12_11-47-10"
 
 MAX_NEW_TOKENS = 512
 NUM_TEST_SAMPLES: int | None = None  # Set to int for subset, None for full test CSV
@@ -30,14 +31,14 @@ TEST_CSV_PATH = PROJECT_ROOT / "csv" / "test.csv"
 PROMPT_PATH = PROJECT_ROOT / "csv" / "prompts" / f"{MODE}.txt"
 
 RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-RUN_NAME = f"predict-{STATE}-{MODE}-{RUN_TIMESTAMP}"
+RUN_NAME = f"predict-{STATE}-{FT_STATE}-{MODE}-{RUN_TIMESTAMP}"
 
 LOG_DIR = PROJECT_ROOT / "csv" / "loggings" / "sft"
 LOG_PATH = LOG_DIR / f"{RUN_NAME}.log"
 RUN_CONFIG_PATH = LOG_DIR / f"run_config_{RUN_NAME}.json"
 
 OUTPUT_DIR = PROJECT_ROOT / "csv" / "outputs"
-OUTPUT_CSV = OUTPUT_DIR / f"predictions_{STATE}_{MODE}_{RUN_TIMESTAMP}.csv"
+OUTPUT_CSV = OUTPUT_DIR / f"predictions_{STATE}_{FT_STATE}_{MODE}_{RUN_TIMESTAMP}.csv"
 OUTPUT_RUN_CONFIG_PATH = OUTPUT_DIR / f"run_config_{RUN_NAME}.json"
 
 
@@ -52,8 +53,26 @@ def _jsonable(value: Any) -> Any:
 
 
 def resolve_model_checkpoint(model_checkpoint: str | Path) -> str:
-    if isinstance(model_checkpoint, Path):
-        return str(model_checkpoint.resolve())
+    checkpoint_path = Path(model_checkpoint) if isinstance(model_checkpoint, Path) else Path(str(model_checkpoint))
+
+    # If a local path is given and points to a GRPO run directory, auto-select
+    # the latest checkpoint-* folder so prediction can run without manual edits.
+    if checkpoint_path.exists():
+        checkpoint_path = checkpoint_path.resolve()
+        if checkpoint_path.is_dir() and not (checkpoint_path / "adapter_config.json").exists():
+            checkpoint_dirs = []
+            for child in checkpoint_path.iterdir():
+                if child.is_dir() and child.name.startswith("checkpoint-"):
+                    try:
+                        step = int(child.name.split("-", 1)[1])
+                        checkpoint_dirs.append((step, child))
+                    except (IndexError, ValueError):
+                        continue
+            if checkpoint_dirs:
+                latest_checkpoint = max(checkpoint_dirs, key=lambda item: item[0])[1]
+                return str(latest_checkpoint)
+        return str(checkpoint_path)
+
     return model_checkpoint
 
 

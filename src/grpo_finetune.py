@@ -32,6 +32,8 @@ from grpo_finetune_config import (
     GRPO_NUM_TRAIN_EPOCHS,
     GRPO_SAVE_STEPS,
     GRPO_SAVE_STRATEGY,
+    GRPO_SAVE_TOTAL_LIMIT,
+    GRPO_SAVE_ONLY_MODEL,
     GRPO_STEPS_PER_GENERATION,
     HF_REPO_NAME,
     JUDGE_DEVICE_STR,
@@ -248,6 +250,8 @@ grpo_config = GRPOConfig(
     logging_steps=GRPO_LOGGING_STEPS,
     save_steps=GRPO_SAVE_STEPS,
     save_strategy=GRPO_SAVE_STRATEGY,
+    save_total_limit=GRPO_SAVE_TOTAL_LIMIT,
+    save_only_model=GRPO_SAVE_ONLY_MODEL,
     report_to=["wandb"],
 )
 

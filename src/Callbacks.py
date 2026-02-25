@@ -142,8 +142,9 @@ class WandBGRPOPredictionLogger(TrainerCallback):
                     temperature=1.0,
                 )
 
-                generated = self.processor.decode(outputs[0], skip_special_tokens=True)
-                prediction_text = generated.rsplit("model\n", 1)[-1].strip() if "model\n" in generated else generated.strip()
+                prompt_len = inputs["input_ids"].shape[1]
+                generated_ids = outputs[0][prompt_len:]
+                prediction_text = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
 
                 parsed_prediction = self.reward_model._run_judge(text=prediction_text)
                 parsed_ground_truth = self.reward_model._run_judge(text=reference_text)
@@ -261,7 +262,8 @@ class GRPOHeldoutRewardEvaluator(TrainerCallback):
                     pad_token_id=pad_token_id,
                 )
 
-                generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+                prompt_len = inputs["input_ids"].shape[1]
+                generated_ids = outputs[0][prompt_len:]
                 has_eos = bool((generated_ids == eos_token_id).any().item()) if eos_token_id is not None else False
                 hit_max_tokens = generated_ids.shape[0] >= self.max_new_tokens
                 if has_eos:
@@ -269,8 +271,7 @@ class GRPOHeldoutRewardEvaluator(TrainerCallback):
                 if hit_max_tokens and not has_eos:
                     clipped += 1
 
-                generated = self.processor.decode(outputs[0], skip_special_tokens=True)
-                prediction_text = generated.rsplit("model\n", 1)[-1].strip() if "model\n" in generated else generated.strip()
+                prediction_text = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
 
                 prompt_texts.append(prompt_text)
                 completion_texts.append(prediction_text)
