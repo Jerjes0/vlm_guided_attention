@@ -16,13 +16,18 @@ from Dataset import ChestXrayDataset
 # ------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-MODE = "image_and_heatmap"  # "image" or "image_and_heatmap"
+MODE = "image"  # "image" or "image_and_heatmap"
 STATE = "ft"
-FT_STATE = 'grpo'
+FT_STATE = None  # Set to None for zero-shot inference.
 
-# Can be a hub model ID or a local run path under models/.
-MODEL_CHECKPOINT = "google/medgemma-1.5-4b-it"
-MODEL_CHECKPOINT = PROJECT_ROOT / "models" / 'medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-grpo-2026-02-14_16-55-27' #"medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-lora-2026-02-12_11-47-10"
+# Base model used for zero-shot inference.
+BASE_MODEL_CHECKPOINT = "google/medgemma-1.5-4b-it"
+# Fine-tuned checkpoint used when FT_STATE is not None.
+MODEL_CHECKPOINT = PROJECT_ROOT / "models" / "heatmap_analysis" / "medgemma-1.5-4b-it-single_image_overlay_new-image-lora-2026-02-27"  # "medgemma-1.5-4b-it-single_image_overlay-image_and_heatmap-lora-2026-02-12_11-47-10"
+
+is_zero_shot = FT_STATE is None
+effective_state = "zs" if is_zero_shot else STATE
+effective_model_checkpoint = BASE_MODEL_CHECKPOINT if is_zero_shot else MODEL_CHECKPOINT
 
 MAX_NEW_TOKENS = 512
 NUM_TEST_SAMPLES: int | None = None  # Set to int for subset, None for full test CSV
@@ -31,14 +36,19 @@ TEST_CSV_PATH = PROJECT_ROOT / "csv" / "test.csv"
 PROMPT_PATH = PROJECT_ROOT / "csv" / "prompts" / f"{MODE}.txt"
 
 RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-RUN_NAME = f"predict-{STATE}-{FT_STATE}-{MODE}-{RUN_TIMESTAMP}"
+run_suffix_parts = [effective_state]
+if FT_STATE is not None:
+    run_suffix_parts.append(FT_STATE)
+run_suffix_parts.extend([MODE, RUN_TIMESTAMP])
+run_suffix = "-".join(run_suffix_parts)
+RUN_NAME = f"predict-{run_suffix}"
 
 LOG_DIR = PROJECT_ROOT / "csv" / "loggings" / "sft"
 LOG_PATH = LOG_DIR / f"{RUN_NAME}.log"
 RUN_CONFIG_PATH = LOG_DIR / f"run_config_{RUN_NAME}.json"
 
-OUTPUT_DIR = PROJECT_ROOT / "csv" / "outputs"
-OUTPUT_CSV = OUTPUT_DIR / f"predictions_{STATE}_{FT_STATE}_{MODE}_{RUN_TIMESTAMP}.csv"
+OUTPUT_DIR = PROJECT_ROOT / "csv" / "outputs" / "heatmap_analysis"
+OUTPUT_CSV = OUTPUT_DIR / f"predictions_{'_'.join(run_suffix_parts)}.csv"
 OUTPUT_RUN_CONFIG_PATH = OUTPUT_DIR / f"run_config_{RUN_NAME}.json"
 
 
@@ -86,12 +96,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("medgemma-predict")
 
-resolved_model_checkpoint = resolve_model_checkpoint(MODEL_CHECKPOINT)
+resolved_model_checkpoint = resolve_model_checkpoint(effective_model_checkpoint)
 run_config = {
     "run_name": RUN_NAME,
     "mode": MODE,
-    "state": STATE,
-    "model_checkpoint": MODEL_CHECKPOINT,
+    "state": effective_state,
+    "ft_state": FT_STATE,
+    "base_model_checkpoint": BASE_MODEL_CHECKPOINT,
+    "model_checkpoint": effective_model_checkpoint,
     "resolved_model_checkpoint": resolved_model_checkpoint,
     "generation": {
         "max_new_tokens": MAX_NEW_TOKENS,
@@ -184,6 +196,7 @@ log.info("Generating predictions")
 
 all_predictions = []
 all_ground_truths = []
+model_header = "<start_of_turn>model"
 
 for idx in tqdm(range(len(test_dataset)), desc="Predicting"):
     example = test_dataset[idx]
@@ -193,6 +206,11 @@ for idx in tqdm(range(len(test_dataset)), desc="Predicting"):
         add_generation_prompt=True,
         tokenize=False,
     ).strip()
+    if idx == 0 and model_header not in prompt_text:
+        log.warning(
+            "Prompt template does not contain '%s'. This may be misaligned with training collate masking.",
+            model_header,
+        )
 
     inputs = processor(
         text=[prompt_text],
@@ -208,17 +226,20 @@ for idx in tqdm(range(len(test_dataset)), desc="Predicting"):
             do_sample=False,
         )
 
-    generated = processor.decode(outputs[0], skip_special_tokens=True)
-
-    if generated.startswith(prompt_text):
-        prediction = generated[len(prompt_text):].strip()
-    else:
-        prediction = generated.strip()
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = outputs[0][prompt_len:]
+    prediction = processor.decode(generated_ids, skip_special_tokens=True).strip()
 
     ground_truth = example["messages"][-1]["content"][0]["text"]
 
     all_predictions.append(prediction)
     all_ground_truths.append(ground_truth)
+
+    # Persist partial predictions on-the-fly for long runs / crash recovery.
+    partial_df = test_df.iloc[: len(all_predictions)].copy()
+    partial_df["prediction"] = all_predictions
+    partial_df["ground_truth"] = all_ground_truths
+    partial_df.to_csv(OUTPUT_CSV, index=False)
 
     if (idx + 1) % 10 == 0:
         log.info("Processed %d/%d samples", idx + 1, len(test_dataset))

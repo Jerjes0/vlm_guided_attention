@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 import wandb
 from peft import LoraConfig
-from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig, EarlyStoppingCallback
 from trl import SFTConfig, SFTTrainer
 
 from Callbacks import WandBPredictionLogger
@@ -15,6 +15,9 @@ from Dataset import ChestXrayDataset
 from finetune_config import (
     EVAL_STEPS,
     EVAL_STRATEGY,
+    EARLY_STOPPING_PATIENCE,
+    EARLY_STOPPING_THRESHOLD,
+    ENABLE_EARLY_STOPPING,
     EXPERIMENT_TAG,
     GRADIENT_ACCUMULATION_STEPS,
     HUB_PRIVATE_REPO,
@@ -44,6 +47,9 @@ from finetune_config import (
     RUN_NAME,
     SAMPLE_RANDOM_SEED,
     SAVE_STRATEGY,
+    SAVE_STEPS,
+    BEST_MODEL_METRIC,
+    BEST_MODEL_GREATER_IS_BETTER,
     TRAIN_CSV_PATH,
     TRAIN_SAMPLE_FRAC,
     VAL_CSV_PATH,
@@ -66,7 +72,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
 )
-log = logging.getLogger(f"medgemma-train-{EXPERIMENT_TAG}")
+log = logging.getLogger(f"heatmap-medgemma-train-{EXPERIMENT_TAG}")
 
 run_config = build_run_config(local_rank=local_rank, is_main_process=is_main_process)
 save_run_config(run_config, RUN_CONFIG_PATH, OUTPUT_RUN_CONFIG_PATH)
@@ -146,39 +152,96 @@ peft_config = LoraConfig(
 )
 
 
-def collate_fn(examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+# def collate_fn(examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+#     texts = []
+#     images = []
+
+#     for example in examples:
+#         images.append([img.convert("RGB") for img in example["images"]])
+#         texts.append(
+#             processor.apply_chat_template(
+#                 example["messages"],
+#                 add_generation_prompt=False,
+#                 tokenize=False,
+#             ).strip()
+#         )
+
+#     batch = processor(
+#         text=texts,
+#         images=images,
+#         return_tensors="pt",
+#         padding=True,
+#     )
+
+#     labels = batch["input_ids"].clone()
+#     image_token_id = [
+#         processor.tokenizer.convert_tokens_to_ids(processor.tokenizer.special_tokens_map["boi_token"])
+#     ]
+
+#     labels[labels == processor.tokenizer.pad_token_id] = -100
+#     labels[labels == image_token_id] = -100
+#     labels[labels == 262144] = -100
+
+#     batch["labels"] = labels
+#     return batch
+
+def collate_fn(examples):
     texts = []
     images = []
-
     for example in examples:
         images.append([img.convert("RGB") for img in example["images"]])
-        texts.append(
-            processor.apply_chat_template(
-                example["messages"],
-                add_generation_prompt=False,
-                tokenize=False,
-            ).strip()
-        )
+        # apply_chat_template creates the full string
+        texts.append(processor.apply_chat_template(
+            example["messages"], add_generation_prompt=False, tokenize=False
+        ).strip())
 
-    batch = processor(
-        text=texts,
-        images=images,
-        return_tensors="pt",
-        padding=True,
-    )
-
+    batch = processor(text=texts, images=images, return_tensors="pt", padding=True)
     labels = batch["input_ids"].clone()
-    image_token_id = [
-        processor.tokenizer.convert_tokens_to_ids(processor.tokenizer.special_tokens_map["boi_token"])
+
+    # 1. Mask Padding
+    labels[labels == processor.tokenizer.pad_token_id] = -100
+    
+    # 2. Mask EVERYTHING before the model's response
+    model_start_patterns = [
+        processor.tokenizer.encode("<start_of_turn>model", add_special_tokens=False),
+        processor.tokenizer.encode("<start_of_turn>model\n", add_special_tokens=False),
     ]
 
-    labels[labels == processor.tokenizer.pad_token_id] = -100
-    labels[labels == image_token_id] = -100
-    labels[labels == 262144] = -100
+    for i in range(labels.shape[0]):
+        # Find where the model starts talking
+        input_id_list = batch["input_ids"][i].tolist()
+        model_idx = -1
+
+        for pattern in model_start_patterns:
+            if not pattern:
+                continue
+            pat_len = len(pattern)
+            for j in range(len(input_id_list) - pat_len + 1):
+                if input_id_list[j : j + pat_len] == pattern:
+                    model_idx = j + pat_len
+                    break
+            if model_idx != -1:
+                break
+
+        if model_idx > 0:
+            labels[i, :model_idx] = -100  # Mask everything up to the answer
+
+    # 3. Mask special tokens that shouldn't be predicted
+    special_tokens_map = processor.tokenizer.special_tokens_map
+    image_special_tokens = [
+        special_tokens_map.get("boi_token"),
+        special_tokens_map.get("eoi_token"),
+        special_tokens_map.get("image_token"),
+    ]
+    for token in image_special_tokens:
+        if not token:
+            continue
+        token_id = processor.tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token_id != processor.tokenizer.unk_token_id:
+            labels[labels == token_id] = -100
 
     batch["labels"] = labels
     return batch
-
 
 resolved_resume_checkpoint = RESUME_FROM_CHECKPOINT
 if RESUME_FROM_CHECKPOINT == "auto":
@@ -199,12 +262,16 @@ args = SFTConfig(
     optim="adamw_torch_fused",
     logging_steps=LOGGING_STEPS,
     save_strategy=SAVE_STRATEGY,
+    save_steps=SAVE_STEPS,
     eval_strategy=EVAL_STRATEGY,
     eval_steps=EVAL_STEPS,
+    load_best_model_at_end=True,
+    metric_for_best_model=BEST_MODEL_METRIC,
+    greater_is_better=BEST_MODEL_GREATER_IS_BETTER,
     learning_rate=LEARNING_RATE,
     bf16=True,
     max_grad_norm=0.3,
-    warmup_ratio=0.03,
+    warmup_ratio= 0.1, #0.03,
     lr_scheduler_type="linear",
     push_to_hub=PUSH_TO_HUB,
     hub_private_repo=HUB_PRIVATE_REPO,
@@ -235,11 +302,26 @@ trainer = SFTTrainer(
     data_collator=collate_fn,
 )
 
+# if ENABLE_EARLY_STOPPING:
+#     trainer.add_callback(
+#         EarlyStoppingCallback(
+#             early_stopping_patience=EARLY_STOPPING_PATIENCE,
+#             early_stopping_threshold=EARLY_STOPPING_THRESHOLD,
+#         )
+#     )
+#     log.info(
+#         "Early stopping enabled (patience=%d, threshold=%s, metric=%s, greater_is_better=%s)",
+#         EARLY_STOPPING_PATIENCE,
+#         EARLY_STOPPING_THRESHOLD,
+#         BEST_MODEL_METRIC,
+#         BEST_MODEL_GREATER_IS_BETTER,
+#     )
+
 trainer.add_callback(
     WandBPredictionLogger(
         dataset=val_dataset,
         processor=processor,
-        num_samples=10,
+        num_samples=2,
     )
 )
 

@@ -17,11 +17,21 @@ class WandBPredictionLogger(TrainerCallback):
         self.processor = processor
         self.num_samples = num_samples
         self.max_new_tokens = max_new_tokens
+        self._last_logged_step = -1
+
+    @staticmethod
+    def _extract_target_text(messages):
+        try:
+            return messages[-1]["content"][0]["text"]
+        except Exception:
+            return ""
 
     def on_evaluate(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
             return
         if wandb.run is None:
+            return
+        if state.global_step == self._last_logged_step:
             return
 
         model = kwargs["model"]
@@ -31,7 +41,11 @@ class WandBPredictionLogger(TrainerCallback):
         rows = []
         max_images_seen = 0
 
-        for i in range(self.num_samples):
+        sample_count = min(self.num_samples, len(self.dataset))
+        if sample_count == 0:
+            return
+
+        for i in range(sample_count):
             example = self.dataset[i]
             images = example["images"]
             messages = example["messages"]
@@ -56,9 +70,10 @@ class WandBPredictionLogger(TrainerCallback):
                     max_new_tokens=self.max_new_tokens,
                 )
 
-            generated = self.processor.decode(outputs[0], skip_special_tokens=True)
-            prediction = generated[len(prompt):].strip() if generated.startswith(prompt) else generated.strip()
-            target = messages[-1]["content"][0]["text"]
+            prompt_len = inputs["input_ids"].shape[1]
+            generated_ids = outputs[0][prompt_len:]
+            prediction = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
+            target = self._extract_target_text(messages)
 
             image_cells = [wandb.Image(img, caption=f"image_{k}") for k, img in enumerate(images)]
             rows.append((image_cells, prediction, target))
@@ -73,6 +88,7 @@ class WandBPredictionLogger(TrainerCallback):
 
         table = wandb.Table(columns=table_columns, data=table_data)
         wandb.log({"predictions": table}, step=state.global_step)
+        self._last_logged_step = state.global_step
 
 
 class WandBGRPOPredictionLogger(TrainerCallback):

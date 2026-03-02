@@ -13,12 +13,12 @@ from Reward import RewardModel
 # Run configuration (edit only here)
 # ------------------------------------------------------------
 CSV_PATH = Path(
-    "/home/jerjes/repos/visual_guided_attention/csv/outputs/predictions_ft_lora_image_and_heatmap_2026-02-18_10-15-02.csv"
+    "/home/jerjes/repos/visual_guided_attention/csv/outputs/heatmap_analysis/predictions_ft_lora_image_and_heatmap_2026-02-28_12-40-39.csv"
 )
 OUTPUT_CSV: Path | None = None
-PROCESS_GROUND_TRUTH = False
+PROCESS_GROUND_TRUTH = True
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SAVE_EVERY = 1
+SAVE_EVERY = 10
 
 
 def to_json_cell(parsed: dict) -> str:
@@ -37,7 +37,7 @@ def main() -> None:
     if not CSV_PATH.exists():
         raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
-    output_csv = OUTPUT_CSV or CSV_PATH.with_name(f"{CSV_PATH.stem}_evaluted.csv")
+    output_csv = OUTPUT_CSV or CSV_PATH.with_name(f"{CSV_PATH.stem}_evaluated.csv")
 
     logging.basicConfig(
         level=logging.INFO,

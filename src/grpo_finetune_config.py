@@ -12,8 +12,8 @@ EXPERIMENT_TAG = "single_image_overlay"
 WANDB_PROJECT = "medgemma-chest-xray-single-image-overlay-rl"
 
 SEED = 42
-EVAL_SAMPLES = 50
-DATASET_FRACTION = 0.5
+EVAL_SAMPLES = 30
+DATASET_FRACTION = 0.2
 
 POLICY_DEVICE_STR = "cuda:0"
 JUDGE_DEVICE_STR = "cuda:1"
@@ -28,14 +28,16 @@ SFT_CHECKPOINT = (
 
 GRPO_LEARNING_RATE = 1e-5
 GRPO_NUM_GENERATIONS = 4
-GRPO_MAX_COMPLETION_LENGTH = 64
+GRPO_MAX_COMPLETION_LENGTH = 256
 GRPO_GRADIENT_ACCUMULATION_STEPS = 8
 GRPO_STEPS_PER_GENERATION = 8
 GRPO_BETA = 0.03
 GRPO_NUM_TRAIN_EPOCHS = 1.0
 GRPO_LOGGING_STEPS = 10
-GRPO_SAVE_STEPS = 10
+GRPO_SAVE_STEPS = 50
 GRPO_SAVE_STRATEGY = "steps"
+GRPO_SAVE_TOTAL_LIMIT = 2
+GRPO_SAVE_ONLY_MODEL = True
 
 TRAIN_CSV_PATH = PROJECT_ROOT / "csv" / "train.csv"
 PROMPT_PATH = PROJECT_ROOT / "csv" / "prompts" / f"{MODE}.txt"
@@ -87,6 +89,8 @@ def build_run_config() -> dict[str, Any]:
             "logging_steps": GRPO_LOGGING_STEPS,
             "save_steps": GRPO_SAVE_STEPS,
             "save_strategy": GRPO_SAVE_STRATEGY,
+            "save_total_limit": GRPO_SAVE_TOTAL_LIMIT,
+            "save_only_model": GRPO_SAVE_ONLY_MODEL,
         },
         "paths": {
             "project_root": PROJECT_ROOT,
